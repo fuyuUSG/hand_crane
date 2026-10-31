@@ -20,6 +20,7 @@
                       グーで止めて手を動かしてからパーにすると, その位置へ移動する.
 """
 
+import math
 from hand_crane import arm_model as am
 
 
@@ -46,11 +47,12 @@ class HandMapper:
     START = {'turn': 0.0, 'z': 0.16, 'r': 0.14}   # relative で最初にパーを出したときの位置
 
     def __init__(self, alpha=0.35, debounce=4, timeout=0.5, invert_turn=False,
-                 control='relative'):
+                 control='relative', release_debounce=12):
         if control not in ('relative', 'absolute'):
             raise ValueError("control は 'relative' か 'absolute'")
         self.alpha = alpha          # 平滑化の強さ (小さいほどなめらかで遅れる)
         self.debounce = debounce    # 同じジェスチャーが何フレーム続いたら切り替えるか
+        self.release_debounce = release_debounce   # つかんでいる最中に「離す」切り替えに必要なフレーム数
         self.timeout = timeout      # この秒数データが来なければ「手が見えない」扱い
         self.invert_turn = invert_turn
         self.control = control
@@ -106,8 +108,16 @@ class HandMapper:
         else:
             self.smooth = None      # グー等のあいだの手の動きは無視する
 
+    def _needed(self, want):
+        """want へ切り替えるのに必要な連続フレーム数."""
+        opens_gripper = want in ('follow', 'home')
+        if self.gripper == 'close' and opens_gripper:
+            return max(self.debounce, self.release_debounce)   # 離すときだけ慎重に
+        return self.debounce
+
     def _switch(self, want, force=False):
-        if force or self.debounce <= 1:
+        need = self._needed(want)
+        if force or need <= 1:
             self.mode, self._cand, self._count = want, None, 0
             return
         if want == self.mode:
@@ -117,7 +127,7 @@ class HandMapper:
             self._count += 1
         else:
             self._cand, self._count = want, 1
-        if self._count >= self.debounce:
+        if self._count >= need:
             self.mode, self._cand, self._count = want, None, 0
 
     # ---- 今の目標姿勢を返す ----
@@ -169,3 +179,23 @@ def step_toward(cur, target, max_step_deg):
         d = max(-max_step_deg, min(max_step_deg, d))
         out[k] = cur[k] + d
     return out
+
+
+
+def step_smooth(cur, vel, target, vmax, amax, dt):
+    """速度だけでなく加速度も制限して target へ近づける (なめらかに動き出し, なめらかに止まる)."""
+    new, nvel = {}, {}
+    for k in am.KEYS:
+        d = target[k] - cur[k]
+        v0 = vel.get(k, 0.0)
+        # 残り距離 |d| をちょうど止まり切れる速度 (20Hz などの刻みでも行き過ぎない)
+        ad = amax * dt
+        v_stop = ad * (-0.5 + math.sqrt(0.25 + 2.0 * abs(d) / (ad * dt))) if ad > 0 else vmax
+        v_des = math.copysign(min(vmax, v_stop), d)
+        v = v0 + max(-amax * dt, min(amax * dt, v_des - v0))
+        step = v * dt
+        if d != 0 and step * d > 0 and abs(step) >= abs(d):   # 目標に届いたらぴったり止める
+            step, v = d, d / dt
+        new[k] = cur[k] + step
+        nvel[k] = v
+    return new, nvel

@@ -10,6 +10,7 @@ Windows 側の hand_sender.py (MediaPipe で手を認識) から UDP で届く�
 """
 
 import json
+import math
 import socket
 import threading
 import time
@@ -21,7 +22,7 @@ from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from hand_crane import arm_model as am
-from hand_crane.mapping import HandMapper, step_toward
+from hand_crane.mapping import HandMapper, step_smooth
 
 ARM_TOPIC = '/crane_plus_arm_controller/joint_trajectory'
 GRIPPER_TOPIC = '/crane_plus_gripper_controller/joint_trajectory'
@@ -40,14 +41,24 @@ class HandTeleop(Node):
         self.declare_parameter('smoothing', 0.35)
         self.declare_parameter('debounce', 4)
         self.declare_parameter('control', 'relative')   # relative (マウス式) / absolute (位置そのまま)
+        self.declare_parameter('release_debounce', 12)  # つかんでいる最中に離すのに必要なフレーム数
+        self.declare_parameter('grab_speed_deg', 30.0)  # つかんでいる間の最大速度 [deg/s]
+        self.declare_parameter('max_accel_deg', 180.0)  # 最大加速度 [deg/s^2]
+        self.declare_parameter('grip_close_deg', 10.0)  # グリッパを閉じる目標角 [deg]. 大きいほど強く握る (上限 38)
 
         self.mapper = HandMapper(
             alpha=self.get_parameter('smoothing').value,
             debounce=self.get_parameter('debounce').value,
             invert_turn=self.get_parameter('invert_turn').value,
-            control=self.get_parameter('control').value)
+            control=self.get_parameter('control').value,
+            release_debounce=self.get_parameter('release_debounce').value)
         self.rate = float(self.get_parameter('rate').value)
-        self.max_step = float(self.get_parameter('max_speed_deg').value) / self.rate
+        self.vmax = float(self.get_parameter('max_speed_deg').value)
+        self.vmax_grab = float(self.get_parameter('grab_speed_deg').value)
+        self.amax = float(self.get_parameter('max_accel_deg').value)
+        close_deg = min(max(float(self.get_parameter('grip_close_deg').value), -30.0), 38.0)
+        self.grip_close = math.radians(close_deg)
+        self.vel = {}                   # 関節ごとの今の速度 [deg/s]
 
         self.arm_pub = self.create_publisher(JointTrajectory, ARM_TOPIC, 10)
         self.grip_pub = self.create_publisher(JointTrajectory, GRIPPER_TOPIC, 10)
@@ -56,6 +67,8 @@ class HandTeleop(Node):
         self.lock = threading.Lock()
         self.packets = 0
         self.last_gesture = '-'
+        self._last_state = None         # (mode, gripper): 切り替わりをログに出すため
+        self._t0 = time.monotonic()
 
         port = int(self.get_parameter('port').value)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -65,7 +78,8 @@ class HandTeleop(Node):
         self.create_timer(1.0 / self.rate, self._tick)
         self.create_timer(0.5, self._status)
         self.get_logger().info(f'UDP {port} 番で Windows 側の手の情報を待っています'
-                               f'（操縦方式: {self.mapper.control}）')
+                               f'（操縦方式: {self.mapper.control}, 握る角度 {close_deg:.0f}°, '
+                               f'つかみ中の速度 {self.vmax_grab:.0f}°/s, 加速度 {self.amax:.0f}°/s²）')
 
     def _on_js(self, msg):
         if self.cmd is not None:
@@ -91,9 +105,15 @@ class HandTeleop(Node):
     def _tick(self):
         with self.lock:
             target, grip, mode = self.mapper.target(time.monotonic())
+        if (mode, grip) != self._last_state:
+            g = 'つかむ' if grip == 'close' else '開く'
+            print(f'\n[{time.monotonic() - self._t0:7.2f}s 切替] {MODE_JA.get(mode, mode)} / グリッパ: {g}',
+                  flush=True)
+            self._last_state = (mode, grip)
         if self.cmd is None:
             self.cmd = dict(am.NEUTRAL)
-        self.cmd = step_toward(self.cmd, target, self.max_step)
+        vmax = self.vmax_grab if grip == 'close' else self.vmax     # つかんでいる間はゆっくり
+        self.cmd, self.vel = step_smooth(self.cmd, self.vel, target, vmax, self.amax, 1.0 / self.rate)
         self._publish(self.cmd, grip)
 
     def _publish(self, pose, grip):
@@ -107,7 +127,7 @@ class HandTeleop(Node):
         g = JointTrajectory()
         g.joint_names = [am.GRIPPER_JOINT_NAME]
         pg = JointTrajectoryPoint()
-        pg.positions = [am.GRIPPER_CLOSE if grip == 'close' else am.GRIPPER_OPEN]
+        pg.positions = [self.grip_close if grip == 'close' else am.GRIPPER_OPEN]
         pg.time_from_start = dt
         g.points.append(pg)
         self.arm_pub.publish(arm)
