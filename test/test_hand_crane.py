@@ -60,8 +60,8 @@ def _pkt(g='paa', x=0.5, y=0.5, size=0.2):
     return {'hand': True, 'x': x, 'y': y, 'size': size, 'pinch': 1.0, 'gesture': g}
 
 
-def test_follow_left_right_up_down():
-    m = HandMapper(debounce=1, alpha=1.0)
+def test_absolute_left_right_up_down():
+    m = HandMapper(debounce=1, alpha=1.0, control='absolute')
     m.update(_pkt(x=0.85), 0.0)
     right, _, mode = m.target(0.0)
     assert mode == 'follow' and right['turn'] < -80
@@ -76,13 +76,14 @@ def test_follow_left_right_up_down():
 
 
 def test_invert_turn():
-    m = HandMapper(debounce=1, alpha=1.0, invert_turn=True)
+    m = HandMapper(debounce=1, alpha=1.0, invert_turn=True, control='absolute')
     m.update(_pkt(x=0.85), 0.0)
     assert m.target(0.0)[0]['turn'] > 80
 
 
 def test_fist_holds_and_peace_goes_home():
     m = HandMapper(debounce=1, alpha=1.0)
+    m.update(_pkt(x=0.5), 0.0)
     m.update(_pkt(x=0.8), 0.0)
     held = m.target(0.0)[0]
     m.update(_pkt('guu', x=0.2), 0.1)
@@ -111,6 +112,7 @@ def test_debounce_ignores_single_frame_glitch():
 
 def test_timeout_means_lost():
     m = HandMapper(debounce=1, alpha=1.0)
+    m.update(_pkt(x=0.5), 0.0)
     m.update(_pkt(x=0.8), 0.0)
     before = m.target(0.0)[0]
     pose, _, mode = m.target(1.0)
@@ -120,3 +122,58 @@ def test_timeout_means_lost():
 def test_step_toward_limits_speed():
     out = step_toward(dict(am.NEUTRAL), {'turn': 90, 'lean': -5, 'elbow': 0, 'wrist': 0}, 3.0)
     assert out['turn'] == 3.0 and out['lean'] == -3.0
+
+
+# ---------------- relative (マウス式) ----------------
+def _tip_z(m, t):
+    return am.arm_points(m.target(t)[0])[-1][1]
+
+
+def test_relative_first_open_hand_does_not_jump_to_hand_position():
+    m = HandMapper(debounce=1, alpha=1.0)
+    m.update(_pkt(x=0.85, y=0.8), 0.0)      # 画面の右下でパーを出しても
+    pose, _, _ = m.target(0.0)
+    assert abs(pose['turn']) < 1e-6          # 右端へ飛ばず START から始まる
+
+
+def test_relative_moves_by_hand_motion():
+    m = HandMapper(debounce=1, alpha=1.0)
+    m.update(_pkt(x=0.5), 0.0)
+    m.update(_pkt(x=0.6), 0.1)              # 右へ 0.1
+    assert m.target(0.1)[0]['turn'] < -20   # ロボットの右へ旋回
+
+
+def test_relative_clutch_like_a_mouse():
+    """ユーザーの報告した操作: パーで上へ → グーで止めて手を下へ → パーで再開しても下がらない."""
+    m = HandMapper(debounce=1, alpha=1.0)
+    m.update(_pkt(y=0.5), 0.0)
+    m.update(_pkt(y=0.25), 0.1)             # パーで上へ
+    z_up = _tip_z(m, 0.1)
+    m.update(_pkt('guu', y=0.25), 0.2)
+    m.update(_pkt('guu', y=0.8), 0.3)       # グーのまま手を下へ戻す
+    assert abs(_tip_z(m, 0.3) - z_up) < 1e-6
+    m.update(_pkt('paa', y=0.8), 0.4)       # パーで再開
+    assert abs(_tip_z(m, 0.4) - z_up) < 1e-6    # 下に飛ばない
+    m.update(_pkt('paa', y=0.6), 0.5)       # さらに上へ動かすと
+    assert _tip_z(m, 0.5) > z_up                # 続きから上がる
+
+
+def test_relative_no_windup_at_workspace_edge():
+    m = HandMapper(debounce=1, alpha=1.0)
+    m.update(_pkt(size=0.2), 0.0)
+    for i in range(1, 30):                  # 届かないほど前へ伸ばし続ける
+        m.update(_pkt(size=0.2 + 0.05 * i), i * 0.03)
+        m.target(i * 0.03)
+    edge = am.arm_points(m.target(1.0)[0])[-1][0]
+    m.update(_pkt(size=1.65), 1.0)
+    m.update(_pkt(size=1.60), 1.03)         # 少し戻すと
+    back = am.arm_points(m.target(1.03)[0])[-1][0]
+    assert back < edge - 1e-3               # すぐに戻り始める (空振りしない)
+
+
+def test_relative_ok_then_fist_keeps_gripper_closed():
+    m = HandMapper(debounce=1, alpha=1.0)
+    m.update(_pkt('ok'), 0.0)
+    assert m.target(0.0)[1] == 'close'
+    m.update(_pkt('guu'), 0.1)
+    assert m.target(0.1)[1] == 'close'

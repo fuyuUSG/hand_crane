@@ -6,6 +6,7 @@ Windows 側の hand_sender.py (MediaPipe で手を認識) から UDP で届く�
 
     ros2 run hand_crane hand_teleop_node
     ros2 run hand_crane hand_teleop_node --ros-args -p invert_turn:=true   # 左右が逆に感じるとき
+    ros2 run hand_crane hand_teleop_node --ros-args -p control:=absolute   # 画面の位置=ロボットの位置
 """
 
 import json
@@ -38,11 +39,13 @@ class HandTeleop(Node):
         self.declare_parameter('invert_turn', False)
         self.declare_parameter('smoothing', 0.35)
         self.declare_parameter('debounce', 4)
+        self.declare_parameter('control', 'relative')   # relative (マウス式) / absolute (位置そのまま)
 
         self.mapper = HandMapper(
             alpha=self.get_parameter('smoothing').value,
             debounce=self.get_parameter('debounce').value,
-            invert_turn=self.get_parameter('invert_turn').value)
+            invert_turn=self.get_parameter('invert_turn').value,
+            control=self.get_parameter('control').value)
         self.rate = float(self.get_parameter('rate').value)
         self.max_step = float(self.get_parameter('max_speed_deg').value) / self.rate
 
@@ -61,7 +64,8 @@ class HandTeleop(Node):
         threading.Thread(target=self._recv_loop, daemon=True).start()
         self.create_timer(1.0 / self.rate, self._tick)
         self.create_timer(0.5, self._status)
-        self.get_logger().info(f'UDP {port} 番で Windows 側の手の情報を待っています')
+        self.get_logger().info(f'UDP {port} 番で Windows 側の手の情報を待っています'
+                               f'（操縦方式: {self.mapper.control}）')
 
     def _on_js(self, msg):
         if self.cmd is not None:
