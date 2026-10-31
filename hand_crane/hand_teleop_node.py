@@ -44,14 +44,16 @@ class HandTeleop(Node):
         self.declare_parameter('release_debounce', 12)  # つかんでいる最中に離すのに必要なフレーム数
         self.declare_parameter('grab_speed_deg', 30.0)  # つかんでいる間の最大速度 [deg/s]
         self.declare_parameter('max_accel_deg', 180.0)  # 最大加速度 [deg/s^2]
-        self.declare_parameter('grip_close_deg', 10.0)  # グリッパを閉じる目標角 [deg]. 大きいほど強く握る (上限 38)
+        self.declare_parameter('sensitivity', 0.6)      # 感度: 手の動きに対するアームの動きの大きさ (1.0 = 元の感度)
+        self.declare_parameter('grip_close_deg', 20.0)  # グリッパを閉じる目標角 [deg]. 大きいほど強く握る (上限 38)
 
         self.mapper = HandMapper(
             alpha=self.get_parameter('smoothing').value,
             debounce=self.get_parameter('debounce').value,
             invert_turn=self.get_parameter('invert_turn').value,
             control=self.get_parameter('control').value,
-            release_debounce=self.get_parameter('release_debounce').value)
+            release_debounce=self.get_parameter('release_debounce').value,
+            sensitivity=self.get_parameter('sensitivity').value)
         self.rate = float(self.get_parameter('rate').value)
         self.vmax = float(self.get_parameter('max_speed_deg').value)
         self.vmax_grab = float(self.get_parameter('grab_speed_deg').value)
@@ -87,6 +89,8 @@ class HandTeleop(Node):
         pos = dict(zip(msg.name, msg.position))
         if all(n in pos for n in am.ARM_JOINT_NAMES):
             self.cmd = am.from_joint_radians([pos[n] for n in am.ARM_JOINT_NAMES])
+            with self.lock:
+                self.mapper.last_pose = dict(self.cmd)   # 起動時のアームの姿勢から操縦を始める
 
     def _recv_loop(self):
         while rclpy.ok():

@@ -45,9 +45,11 @@ class HandMapper:
     Z_LIMIT = (0.04, 0.30)
     R_LIMIT = (0.04, 0.24)
     START = {'turn': 0.0, 'z': 0.16, 'r': 0.14}   # relative で最初にパーを出したときの位置
+    BLEND_DIST = 0.06              # relative: 最初の姿勢から START の姿勢へ移り終えるまでに手を動かす距離 [m]
+    BLEND_DEADBAND = 0.01          # relative: これより小さい動きは手のぶれとみなして無視する [m]
 
     def __init__(self, alpha=0.35, debounce=4, timeout=0.5, invert_turn=False,
-                 control='relative', release_debounce=12):
+                 control='relative', release_debounce=12, sensitivity=1.0):
         if control not in ('relative', 'absolute'):
             raise ValueError("control は 'relative' か 'absolute'")
         self.alpha = alpha          # 平滑化の強さ (小さいほどなめらかで遅れる)
@@ -58,6 +60,8 @@ class HandMapper:
         self.control = control
         self.smooth = None          # 平滑化した (x, y, size)
         self.task = None            # relative: 手先の目標 {'turn', 'z', 'r'}
+        self._blend_from = None     # relative: 追従を始めたときの姿勢 (ここから少しずつ移る)
+        self._blend = 1.0           # relative: 0 = 始めの姿勢のまま, 1 = 手先の目標どおり
         self.mode = 'hold'
         self._cand, self._count = None, 0
         self.last_time = None
@@ -68,6 +72,10 @@ class HandMapper:
         self.k_turn = -2 * self.TURN_MAX / (self.X_RANGE[1] - self.X_RANGE[0])
         self.k_z = (self.Z_RANGE[1] - self.Z_RANGE[0]) / (self.Y_RANGE[1] - self.Y_RANGE[0])
         self.k_r = (self.R_RANGE[1] - self.R_RANGE[0]) / (self.SIZE_RANGE[1] - self.SIZE_RANGE[0])
+        # 感度: 小さくすると, 同じ手の動きでロボットが小さく動く (relative のみ)
+        self.k_turn *= sensitivity
+        self.k_z *= sensitivity
+        self.k_r *= sensitivity
         if invert_turn:
             self.k_turn = -self.k_turn
 
@@ -95,6 +103,9 @@ class HandMapper:
                 self.smooth = cur
                 if self.task is None:
                     self.task = dict(self.START)
+                    self._task0 = dict(self.START)
+                    self._blend_from = dict(self.last_pose)
+                    self._blend = 0.0
                 return
             a = self.alpha
             new = tuple(a * c + (1 - a) * s for c, s in zip(cur, self.smooth))
@@ -104,6 +115,17 @@ class HandMapper:
                 t['turn'] = min(max(t['turn'] + self.k_turn * dx, -self.TURN_LIMIT), self.TURN_LIMIT)
                 t['z'] = min(max(t['z'] + self.k_z * dy, self.Z_LIMIT[0]), self.Z_LIMIT[1])
                 t['r'] = min(max(t['r'] + self.k_r * ds, self.R_LIMIT[0]), self.R_LIMIT[1])
+                if self._blend < 1.0:
+                    t = self.task
+                t['turn'] = min(max(t['turn'] + self.k_turn * dx, -self.TURN_LIMIT), self.TURN_LIMIT)
+                t['z'] = min(max(t['z'] + self.k_z * dy, self.Z_LIMIT[0]), self.Z_LIMIT[1])
+                t['r'] = min(max(t['r'] + self.k_r * ds, self.R_LIMIT[0]), self.R_LIMIT[1])
+                if self._blend < 1.0:
+                    t0 = self._task0
+                    away = math.hypot(t['r'] - t0['r'], t['z'] - t0['z']) \
+                        + t['r'] * math.radians(abs(t['turn'] - t0['turn']))
+                    b = (away - self.BLEND_DEADBAND) / self.BLEND_DIST
+                    self._blend = min(1.0, max(self._blend, b))
             self.smooth = new
         else:
             self.smooth = None      # グー等のあいだの手の動きは無視する
@@ -138,6 +160,20 @@ class HandMapper:
             turn = -turn
         return turn, interp(y, *self.Y_RANGE, *self.Z_RANGE), interp(size, *self.SIZE_RANGE, *self.R_RANGE)
 
+    def _solve(self, turn, r, z, pitch, commit=True):
+        pose, shrunk = am.reach_pose(r, z, turn, pitch)
+        if pose is None:
+            self.note = '届かない位置なので止まっています'
+            return None
+        if commit:
+            self.last_pose = pose
+        if shrunk:
+            self.note = '届く範囲の端です'
+            if self.control == 'relative':
+                tr, tz = am.arm_points(pose)[-1]
+                self.task['r'], self.task['z'] = tr, tz
+        return pose
+    
     def target(self, now):
         """戻り値: (pose, gripper('open'/'close'), mode)"""
         if self.last_time is None or now - self.last_time > self.timeout:
@@ -152,21 +188,22 @@ class HandMapper:
                 if self.smooth is None:
                     return dict(self.last_pose), self.gripper, self.mode
                 turn, z, r = self._goal_absolute()
+                pitch = interp(z, self.Z_RANGE[1], self.Z_RANGE[0], 150.0, 70.0)
+                self._solve(turn, r, z, pitch)
+            elif self._blend <= 0.0:
+                pass                # 最初にパーを出しただけで, 手はまだ動いていない -> 今の姿勢のまま
             else:
-                turn, z, r = self.task['turn'], self.task['z'], self.task['r']
-            pitch = interp(z, self.Z_RANGE[1], self.Z_RANGE[0], 150.0, 70.0)  # 低いほど手先を下に向ける
-            pose, shrunk = am.reach_pose(r, z, turn, pitch)
-            if pose is None:
-                self.note = '届かない位置なので止まっています'
-            else:
-                self.last_pose = pose
-                if shrunk:
-                    self.note = '届く範囲の端です'
-                    if self.control == 'relative':
-                        # 届かない方向へ目標だけが進み続けないよう, 実際の手先位置に合わせる
-                        # (こうしないと, 戻すときに「しばらく動かない」区間ができる)
-                        tr, tz = am.arm_points(pose)[-1]
-                        self.task['r'], self.task['z'] = tr, tz
+                t = self.task
+                pitch = interp(t['z'], self.Z_RANGE[1], self.Z_RANGE[0], 150.0, 70.0)
+                start = self._blend_from
+                pose = self._solve(t['turn'], t['r'], t['z'], pitch, commit=start is None)
+                if pose is not None and start is not None:
+                    b = self._blend
+                    mixed = {k: (1 - b) * start[k] + b * pose[k] for k in am.KEYS}
+                    if am.is_safe(mixed):
+                        self.last_pose = mixed
+                    if b >= 1.0:
+                        self._blend_from = None
             self.gripper = 'close' if self.mode == 'grab' else 'open'
         return dict(self.last_pose), self.gripper, self.mode
 
