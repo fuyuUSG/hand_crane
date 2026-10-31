@@ -1,0 +1,8 @@
+__pycache__/
+*.egg-info/
+build/
+install/
+log/
+windows/.venv/
+windows/hand_landmarker.task
+docs/
